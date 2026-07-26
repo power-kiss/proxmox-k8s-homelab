@@ -1,0 +1,102 @@
+# Кластер PostgreSQL под управлением CloudNativePG.
+#
+# Установка оператора:
+#   helm repo add cnpg https://cloudnative-pg.github.io/charts && helm repo update
+#   helm install cnpg cnpg/cloudnative-pg -n cnpg-system --create-namespace --wait
+#   kubectl create namespace db
+#   kubectl apply -f 20-cnpg-secrets.yaml -f 21-cnpg-cluster.yaml
+#
+# Плагин kubectl (очень пригодится):
+#   kubectl krew install cnpg
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg
+  namespace: db
+spec:
+  # 1 primary + 2 реплики. Нечётное число — чтобы при отказе primary
+  # оставшиеся могли однозначно выбрать нового.
+  instances: 3
+
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+
+  # unsupervised — оператор сам проводит switchover при обновлении.
+  # supervised потребует ручного подтверждения: осмысленно для критичного прода.
+  primaryUpdateStrategy: unsupervised
+
+  storage:
+    size: 20Gi
+    # local-path — встроенный в k3s провижнер, данные лежат на системном диске ноды.
+    # Локальное хранилище здесь осознанный выбор: PostgreSQL реплицируется сам,
+    # поверх реплицируемого тома получилась бы избыточность в квадрате.
+    storageClass: local-path
+
+  # Отдельный том под WAL — на нагруженной базе это заметно снижает
+  # взаимное влияние последовательной записи журнала и случайного I/O данных.
+  # walStorage:
+  #   size: 10Gi
+  #   storageClass: local-path
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "512MB"
+      effective_cache_size: "1536MB"
+      work_mem: "8MB"
+      maintenance_work_mem: "128MB"
+      # Логировать всё, что дольше полусекунды — основной инструмент поиска
+      # медленных запросов вместе с pg_stat_statements.
+      log_min_duration_statement: "500"
+      shared_preload_libraries: "pg_stat_statements"
+
+  bootstrap:
+    initdb:
+      database: appdb
+      owner: app
+      secret:
+        name: app-db-creds
+      # Явная локаль и кодировка: расхождение collation между версиями
+      # ломает индексы по текстовым полям — редкая, но крайне неприятная проблема.
+      encoding: UTF8
+      localeCollate: C
+      localeCType: C
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+
+  # Разносим инстансы по разным нодам. Без этого две реплики могут оказаться
+  # на одной ноде, и её потеря унесёт кворум.
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required
+
+  monitoring:
+    enablePodMonitor: true
+
+  backup:
+    retentionPolicy: "7d"
+    # ⚠️ В свежих версиях CloudNativePG встроенный barmanObjectStore объявлен
+    #    устаревшим в пользу плагина barman-cloud. Сверься с документацией
+    #    своей версии оператора — синтаксис мог измениться.
+    barmanObjectStore:
+      destinationPath: "s3://pg-backups/"
+      endpointURL: "http://minio.minio.svc.cluster.local"
+      s3Credentials:
+        accessKeyId:
+          name: minio-s3-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: minio-s3-creds
+          key: ACCESS_SECRET_KEY
+      wal:
+        compression: gzip
+        maxParallel: 2
+      data:
+        compression: gzip
+        jobs: 2

@@ -1,0 +1,29 @@
+# MetalLB выдаёт сервисам типа LoadBalancer настоящие адреса из твоей домашней сети.
+# Это ближе к тому, как устроен прод в облаке, чем встроенный в k3s servicelb.
+#
+# ⚠️ Диапазон ОБЯЗАН быть исключён из DHCP-пула роутера, иначе получишь
+#    конфликт адресов, который диагностируется очень неприятно.
+#    DHCP-пул на роутере сужен до .10-.229, диапазон .230-.254 отдан под статику:
+#    .230 хост Proxmox, .231-.233 ноды k3s, .240-.254 пул MetalLB (ниже).
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: homelab-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.10.240-192.168.10.254
+  autoAssign: true
+---
+# L2Advertisement — MetalLB отвечает на ARP-запросы за эти адреса.
+# Работает в любой сети, но весь трафик сервиса идёт через одну ноду (нет балансировки на L2).
+# Альтернатива — режим BGP, если роутер умеет; тогда трафик распределяется по нодам.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: homelab-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - homelab-pool

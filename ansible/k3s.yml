@@ -1,0 +1,257 @@
+---
+# Развёртывание k3s в HA-режиме (embedded etcd) + подготовка дисков под MinIO.
+#
+# Запуск:
+#   ansible-galaxy collection install ansible.posix community.general
+#   ansible-playbook -i inventory.ini k3s.yml
+#
+# Проверка после:
+#   export KUBECONFIG=$PWD/kubeconfig && kubectl get nodes -o wide
+
+- name: Базовая подготовка всех нод
+  hosts: k3s_cluster
+  become: true
+  vars:
+    # По одному диску с каждого физического SSD.
+    # Порядок scsi1 → /dev/sdb, scsi2 → /dev/sdc задаётся в Terraform.
+    minio_disks:
+      - { dev: /dev/sdb, mount: /mnt/minio/disk1 }
+      - { dev: /dev/sdc, mount: /mnt/minio/disk2 }
+
+  tasks:
+    - name: Установить системные пакеты
+      ansible.builtin.apt:
+        name:
+          - qemu-guest-agent   # Proxmox видит IP и умеет graceful shutdown
+          - xfsprogs           # ФС для дисков MinIO
+          - curl
+          - chrony             # расхождение времени ломает etcd и TLS
+          - open-iscsi         # понадобится, если позже добавишь Longhorn
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Включить qemu-guest-agent и chrony
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - qemu-guest-agent
+        - chrony
+
+    # Kubelet отказывается стартовать при включённом swap: планировщик рассчитывает
+    # ресурсы исходя из физической памяти, swap ломает эту модель.
+    - name: Выключить swap в текущей сессии
+      ansible.builtin.command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: ansible_swaptotal_mb | int > 0
+
+    - name: Убрать swap из fstab
+      ansible.posix.mount:
+        path: swap
+        fstype: swap
+        state: absent
+
+    - name: Загрузить модули ядра
+      community.general.modprobe:
+        name: "{{ item }}"
+        state: present
+        persistent: present
+      loop:
+        - br_netfilter
+        - overlay
+
+    - name: Параметры ядра для Kubernetes
+      ansible.posix.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/99-kubernetes.conf
+        sysctl_set: true
+        reload: true
+      loop:
+        - { name: net.ipv4.ip_forward, value: "1" }
+        - { name: net.bridge.bridge-nf-call-iptables, value: "1" }
+        - { name: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+        # inotify — реальная боль на нодах с большим числом подов:
+        # без этого получишь "too many open files" в самых неожиданных местах
+        - { name: fs.inotify.max_user_instances, value: "8192" }
+        - { name: fs.inotify.max_user_watches, value: "524288" }
+
+    # --- Диски под MinIO ---
+
+    - name: Проверить наличие дисков данных
+      ansible.builtin.stat:
+        path: "{{ item.dev }}"
+      loop: "{{ minio_disks }}"
+      loop_control:
+        label: "{{ item.dev }}"
+      register: data_disks
+
+    - name: Остановиться, если дисков нет
+      ansible.builtin.fail:
+        msg: >-
+          Не найдены диски {{ minio_disks | map(attribute='dev') | join(', ') }}.
+          Проверь, что Terraform создал их (scsi1, scsi2) и что имена совпадают — lsblk.
+      when: data_disks.results | selectattr('stat.exists') | list | length == 0
+
+    # Модуль filesystem идемпотентен: если XFS уже есть, ничего не делает
+    # и существующие данные не трогает.
+    - name: Создать XFS на дисках данных
+      community.general.filesystem:
+        fstype: xfs
+        dev: "{{ item.item.dev }}"
+      loop: "{{ data_disks.results }}"
+      loop_control:
+        label: "{{ item.item.dev }}"
+      when: item.stat.exists
+
+    - name: Получить UUID дисков
+      ansible.builtin.command: "blkid -s UUID -o value {{ item.item.dev }}"
+      loop: "{{ data_disks.results }}"
+      loop_control:
+        label: "{{ item.item.dev }}"
+      when: item.stat.exists
+      register: disk_uuids
+      changed_when: false
+
+    # Монтируем по UUID, а не по /dev/sdb: порядок именования устройств
+    # ядром не гарантирован, после перезагрузки диски могут поменяться местами.
+    - name: Смонтировать диски данных
+      ansible.posix.mount:
+        path: "{{ item.item.item.mount }}"
+        src: "UUID={{ item.stdout }}"
+        fstype: xfs
+        opts: defaults,noatime
+        state: mounted
+      loop: "{{ disk_uuids.results }}"
+      loop_control:
+        label: "{{ item.item.item.mount | default('skipped') }}"
+      when: not (item.skipped | default(false))
+
+    - name: Права на точки монтирования
+      ansible.builtin.file:
+        path: "{{ item.mount }}"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0755"
+      loop: "{{ minio_disks }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+
+- name: Первая нода — инициализация кластера
+  hosts: k3s_first
+  become: true
+  vars:
+    k3s_channel: stable   # либо зафиксируй версию ниже
+
+  tasks:
+    - name: Установить k3s server с инициализацией etcd
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_CHANNEL={{ k3s_channel }} \
+          sh -s - server \
+            --cluster-init \
+            --disable traefik \
+            --disable servicelb \
+            --tls-san {{ ansible_host }} \
+            --write-kubeconfig-mode 0644 \
+            --node-label 'homelab.local/storage=minio'
+      args:
+        creates: /etc/systemd/system/k3s.service
+      # traefik отключаем — поставим ingress-nginx (он на рынке распространённее)
+      # servicelb отключаем — поставим MetalLB (ближе к тому, как это выглядит в проде)
+
+    - name: Дождаться готовности API
+      ansible.builtin.wait_for:
+        port: 6443
+        host: "{{ ansible_host }}"
+        timeout: 180
+
+    - name: Прочитать токен кластера
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token_raw
+
+    - name: Сохранить токен как факт
+      ansible.builtin.set_fact:
+        k3s_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+
+
+- name: Остальные control-plane ноды
+  hosts: k3s_servers:!k3s_first
+  become: true
+  serial: 1   # по одной: etcd должен успеть принять нового участника
+  vars:
+    k3s_channel: stable
+    first_server: "{{ hostvars[groups['k3s_first'][0]]['ansible_host'] }}"
+    k3s_token: "{{ hostvars[groups['k3s_first'][0]]['k3s_token'] }}"
+
+  tasks:
+    - name: Присоединить ноду как server
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_CHANNEL={{ k3s_channel }} \
+          K3S_TOKEN='{{ k3s_token }}' \
+          sh -s - server \
+            --server https://{{ first_server }}:6443 \
+            --disable traefik \
+            --disable servicelb \
+            --tls-san {{ ansible_host }} \
+            --write-kubeconfig-mode 0644 \
+            --node-label 'homelab.local/storage=minio'
+      args:
+        creates: /etc/systemd/system/k3s.service
+
+    - name: Дождаться готовности API на ноде
+      ansible.builtin.wait_for:
+        port: 6443
+        host: "{{ ansible_host }}"
+        timeout: 180
+
+
+- name: Рабочие ноды
+  hosts: k3s_agents
+  become: true
+  vars:
+    k3s_channel: stable
+    first_server: "{{ hostvars[groups['k3s_first'][0]]['ansible_host'] }}"
+    k3s_token: "{{ hostvars[groups['k3s_first'][0]]['k3s_token'] }}"
+
+  tasks:
+    - name: Присоединить ноду как agent
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_CHANNEL={{ k3s_channel }} \
+          K3S_URL=https://{{ first_server }}:6443 \
+          K3S_TOKEN='{{ k3s_token }}' \
+          sh -s - agent \
+            --node-label 'homelab.local/storage=minio'
+      args:
+        creates: /etc/systemd/system/k3s-agent.service
+
+
+- name: Забрать kubeconfig
+  hosts: k3s_first
+  become: true
+
+  tasks:
+    - name: Скачать kubeconfig на управляющую машину
+      ansible.builtin.fetch:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ playbook_dir }}/kubeconfig"
+        flat: true
+
+    - name: Заменить 127.0.0.1 на реальный адрес ноды
+      ansible.builtin.replace:
+        path: "{{ playbook_dir }}/kubeconfig"
+        regexp: '127\.0\.0\.1'
+        replace: "{{ ansible_host }}"
+      delegate_to: localhost
+      become: false
+
+    - name: Подсказка
+      ansible.builtin.debug:
+        msg: "Готово. Выполни:  export KUBECONFIG={{ playbook_dir }}/kubeconfig && kubectl get nodes -o wide"

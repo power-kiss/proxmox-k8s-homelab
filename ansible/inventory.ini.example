@@ -1,0 +1,29 @@
+# Скопировать в inventory.ini и подставить свои IP.
+# Или сгенерировать из Terraform:
+#   cd ../terraform && terraform output -raw ansible_inventory > ../ansible/inventory.ini
+
+# Нода, которая поднимает кластер (--cluster-init). Ровно одна.
+[k3s_first]
+k3s-1 ansible_host=192.168.10.231
+
+# Все control-plane ноды, включая первую.
+# Нечётное количество — иначе etcd не соберёт кворум.
+[k3s_servers]
+k3s-1 ansible_host=192.168.10.231
+k3s-2 ansible_host=192.168.10.232
+k3s-3 ansible_host=192.168.10.233
+
+# Отдельных worker-нод в раскладке под i3-8100 нет:
+# все три ноды совмещают control-plane и рабочую нагрузку.
+# Группа оставлена пустой, чтобы плейбук работал без правок,
+# если позже добавишь агентов.
+[k3s_agents]
+
+[k3s_cluster:children]
+k3s_servers
+k3s_agents
+
+[k3s_cluster:vars]
+ansible_user=ubuntu
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'

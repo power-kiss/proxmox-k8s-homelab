@@ -1,0 +1,36 @@
+# --- Секреты и стейт: НИКОГДА не коммитить ---
+terraform.tfvars
+*.auto.tfvars
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+
+# Ansible
+ansible/inventory.ini
+ansible/kubeconfig
+*.retry
+.vault_pass
+
+# Kubernetes / доступы
+kubeconfig
+*.kubeconfig
+
+# SSH-ключи
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+
+# Локальные секреты k8s с реальными значениями
+# (в репозитории лежат только шаблоны с заглушками ЗАМЕНИ_МЕНЯ)
+*-secrets.local.yaml
+
+# Редакторы / ОС
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

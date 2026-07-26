@@ -1,0 +1,109 @@
+# Кластер MinIO через MinIO Operator.
+#
+# Установка оператора:
+#   helm repo add minio-operator https://operator.min.io && helm repo update
+#   helm install minio-operator minio-operator/operator -n minio-operator --create-namespace --wait
+#   kubectl create namespace minio
+#   kubectl apply -f 10-minio-tenant.yaml
+#
+# ⚠️ ПАРОЛЬ НИЖЕ — ЗАГЛУШКА. Поменяй перед применением.
+#    В настоящем проекте секрет берётся из Vault / External Secrets, а не лежит в git.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: minio
+type: Opaque
+stringData:
+  config.env: |-
+    export MINIO_ROOT_USER="minioadmin"
+    export MINIO_ROOT_PASSWORD="ЗАМЕНИ_МЕНЯ_на_длинный_пароль"
+    export MINIO_BROWSER="on"
+    # Схема избыточности задана явно, а не оставлена на умолчание.
+    # 6 дисков, EC:3 — три блока данных и три блока чётности:
+    #   • полезная ёмкость = половина сырой
+    #   • переживает потерю одной ноды целиком (это сразу 2 диска из 6)
+    #     и на чтение, и на запись
+    # Умолчание зависит от версии MinIO и числа дисков — надёжнее задать самому.
+    export MINIO_STORAGE_CLASS_STANDARD="EC:3"
+---
+apiVersion: minio.min.io/v2
+kind: Tenant
+metadata:
+  name: homelab
+  namespace: minio
+spec:
+  configuration:
+    name: minio-creds
+
+  # Самоподписанные сертификаты оператора отключены ради простоты стенда.
+  # В проде — cert-manager и нормальный TLS.
+  requestAutoCert: false
+
+  mountPath: /export
+
+  pools:
+    - name: pool-0
+      # 3 сервера × 2 диска = 6 дисков в одном erasure set.
+      # Два диска каждой ноды лежат на РАЗНЫХ физических SSD —
+      # это позволяет отработать сценарий отказа физического устройства.
+      servers: 3
+      volumesPerServer: 2
+
+      volumeClaimTemplate:
+        metadata:
+          name: data
+        spec:
+          accessModes: [ReadWriteOnce]
+          storageClassName: minio-local
+          resources:
+            requests:
+              storage: 33Gi
+
+      # Один под MinIO на ноду. Без этого два пода могли бы попасть на одну ноду,
+      # и её потеря унесла бы 4 диска из 6 — это уже отказ кластера.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: v1.min.io/tenant
+                    operator: In
+                    values: [homelab]
+              topologyKey: kubernetes.io/hostname
+
+      resources:
+        requests:
+          cpu: "300m"      # на i3-8100 запросы держим скромными
+          memory: 1Gi
+        limits:
+          # CPU limit намеренно не задан: троттлинг бьёт по latency,
+          # а память ограничиваем, потому что она несжимаема.
+          memory: 2Gi
+
+  # Метрики для Prometheus (этап 7)
+  prometheusOperator: false
+
+  # Отдать API и консоль наружу
+  exposeServices:
+    minio: true
+    console: true
+---
+# Сервис с адресом из пула MetalLB — чтобы ходить в MinIO с ноутбука,
+# а не только через port-forward.
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-lb
+  namespace: minio
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: 192.168.10.240
+spec:
+  type: LoadBalancer
+  selector:
+    v1.min.io/tenant: homelab
+  ports:
+    - name: http-minio
+      port: 9000
+      targetPort: 9000

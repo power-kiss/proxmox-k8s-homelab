@@ -1,0 +1,75 @@
+# Резервное копирование PostgreSQL: расписание + разовый запуск.
+#
+# Главное упражнение этапа 6 — не сделать бэкап, а ВОССТАНОВИТЬСЯ из него
+# и засечь секундомером фактические RTO и RPO. Пример восстановления — внизу файла.
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: pg-nightly
+  namespace: db
+spec:
+  # Формат с секундами: сек мин час день месяц день_недели
+  schedule: "0 0 2 * * *"     # каждую ночь в 02:00
+  backupOwnerReference: self
+  cluster:
+    name: pg
+---
+# Разовый бэкап: kubectl apply -f этого файла, затем kubectl get backup -n db
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: pg-manual-001
+  namespace: db
+spec:
+  cluster:
+    name: pg
+
+# ============================================================================
+# ВОССТАНОВЛЕНИЕ НА МОМЕНТ ВРЕМЕНИ (PITR)
+# ============================================================================
+#
+# Сценарий тренировки:
+#   1. Создать таблицу и наполнить данными
+#   2. Дождаться бэкапа и архивации WAL
+#   3. Записать точное время: date -u +"%Y-%m-%dT%H:%M:%SZ"
+#   4. Удалить таблицу — имитация "уронили прод"
+#   5. Применить манифест ниже, подставив время ДО удаления
+#   6. Засечь, за сколько поднялся новый кластер (RTO) и сколько данных
+#      потеряно относительно момента аварии (RPO)
+#
+# Новый кластер создаётся РЯДОМ со старым — так делают и в проде:
+# сначала поднимают копию, проверяют данные, только потом переключают трафик.
+#
+# ---
+# apiVersion: postgresql.cnpg.io/v1
+# kind: Cluster
+# metadata:
+#   name: pg-restored
+#   namespace: db
+# spec:
+#   instances: 1
+#   imageName: ghcr.io/cloudnative-pg/postgresql:16
+#   storage:
+#     size: 20Gi
+#     storageClass: local-path
+#   bootstrap:
+#     recovery:
+#       source: pg-source
+#       recoveryTarget:
+#         targetTime: "2026-07-24 12:30:00.000000+00:00"
+#   externalClusters:
+#     - name: pg-source
+#       barmanObjectStore:
+#         destinationPath: "s3://pg-backups/"
+#         endpointURL: "http://minio.minio.svc.cluster.local"
+#         serverName: pg
+#         s3Credentials:
+#           accessKeyId:
+#             name: minio-s3-creds
+#             key: ACCESS_KEY_ID
+#           secretAccessKey:
+#             name: minio-s3-creds
+#             key: ACCESS_SECRET_KEY
+#         wal:
+#           maxParallel: 2
