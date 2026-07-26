@@ -4,9 +4,11 @@ terraform {
   required_providers {
     proxmox = {
       # Актуальный провайдер. telmate/proxmox давно не развивается — не используй его.
-      # Проверь последнюю версию: https://registry.terraform.io/providers/bpg/proxmox
+      # Из РФ реестр недоступен (403), поэтому провайдер ставится из filesystem mirror
+      # (скачивается напрямую с GitHub bpg/terraform-provider-proxmox). Ограничение
+      # ослаблено до ">=", чтобы подошла свежая версия из зеркала.
       source  = "bpg/proxmox"
-      version = "~> 0.66"
+      version = ">= 0.66"
     }
   }
 
