@@ -16,7 +16,7 @@ terraform {
   # сильный пункт в резюме: "state в S3-совместимом хранилище с версионированием".
   #
   # backend "s3" {
-  #   endpoints                   = { s3 = "http://192.168.10.240:9000" }
+  #   endpoints                   = { s3 = "http://192.168.10.241:9000" }
   #   bucket                      = "tf-state"
   #   key                         = "homelab/proxmox/terraform.tfstate"
   #   region                      = "us-east-1"

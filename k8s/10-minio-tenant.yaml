@@ -92,13 +92,14 @@ spec:
 ---
 # Сервис с адресом из пула MetalLB — чтобы ходить в MinIO с ноутбука,
 # а не только через port-forward.
+# .240 занят ingress-nginx, поэтому S3 MinIO — на .241.
 apiVersion: v1
 kind: Service
 metadata:
   name: minio-lb
   namespace: minio
   annotations:
-    metallb.universe.tf/loadBalancerIPs: 192.168.10.240
+    metallb.universe.tf/loadBalancerIPs: 192.168.10.241
 spec:
   type: LoadBalancer
   selector:
