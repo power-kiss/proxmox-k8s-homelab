@@ -48,7 +48,9 @@ spec:
       # Логировать всё, что дольше полусекунды — основной инструмент поиска
       # медленных запросов вместе с pg_stat_statements.
       log_min_duration_statement: "500"
-      shared_preload_libraries: "pg_stat_statements"
+      # shared_preload_libraries НЕ задаём: это фиксированный параметр, им управляет
+      # сам CNPG (и по умолчанию уже подгружает pg_stat_statements). Явно задать нельзя —
+      # оператор отвергает Cluster с ошибкой "Can't set fixed configuration parameter".
 
   bootstrap:
     initdb:
@@ -76,8 +78,11 @@ spec:
     topologyKey: kubernetes.io/hostname
     podAntiAffinityType: required
 
+  # PodMonitor включим на этапе мониторинга (kube-prometheus-stack) — сейчас
+  # CRD PodMonitor ещё нет в кластере. До тех пор оставляем false, иначе оператор
+  # не сможет создать ресурс мониторинга.
   monitoring:
-    enablePodMonitor: true
+    enablePodMonitor: false
 
   backup:
     retentionPolicy: "7d"
